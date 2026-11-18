@@ -1,0 +1,23 @@
+# ???????????
+autostart-backup.json
+autostart-backup-files/
+free-ram.config.json
+
+# ????
+*.zip
+*.7z
+*.tar.gz
+dist/
+build/
+
+# ?? / ????
+_*.ps1
+_*.txt
+*.log
+*.tmp
+*.bak
+
+# ??
+Thumbs.db
+desktop.ini
+.DS_Store
