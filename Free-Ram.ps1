@@ -44,7 +44,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('report', 'suggest', 'trim', 'purge', 'kill', 'full', 'watch')]
+    [ValidateSet('report', 'suggest', 'trim', 'purge', 'kill', 'full', 'watch', 'auto')]
     [string]$Mode = 'report',
 
     [ValidateSet('light', 'normal', 'heavy')]
@@ -61,6 +61,8 @@ param(
     [switch]$NoGameGuard,
     [switch]$IncludeGame,
     [switch]$IncludeWindowed,
+    [switch]$IncludeCautious,
+    [int]$MinScore = 70,
     [switch]$Elevate,
 
     [int]$Interval = 300,
@@ -438,6 +440,271 @@ function Test-IsSteam($proc) {
 }
 
 # ============================================================
+#  通用评分引擎
+#  不靠「认识某个具体进程名」，靠「行为特征」判断一个进程值不值得回收。
+#  规则在任何 Windows 机器上成立，换电脑不需要改任何东西。
+# ============================================================
+
+# 否决级保护：命中就一分不给，直接排除
+$script:GuardSystem = ('^(system|idle|registry|smss|csrss|wininit|winlogon|services|lsass|lsaiso|' +
+    'dwm|fontdrvhost|svchost|wmiprvse|audiodg|memcompression|memory compression|trustedinstaller|' +
+    'tiworker|spoolsv|taskhostw|msmpeng|nissrv|securityhealthservice|securityhealthsystray|' +
+    'explorer|sihost|conhost|openconsole|ctfmon|shellexperiencehost|startmenuexperiencehost|' +
+    'textinputhost|runtimebroker|dllhost|lockapp|logonui|userinit|applicationframehost|' +
+    'backgroundtaskhost|shellhost|wmiprvse|msdtc|searchindexer|searchhost|searchapp|' +
+    'smartscreen|securityhealth|sgrmbroker|wininit|lsm|mpdefendercoreservice)$')
+
+$script:GuardGame = ('steam|epic|battlenet|battle\.net|riot|gog|origin|ubisoft|uplay|xbox|gamebar|' +
+    'gamingservices|easyanticheat|battleye|vanguard|anticheatexpert|ace-|sguard|nprotect|' +
+    'gameguard|gameoverlay|reliccardinal|nvcontainer')
+
+$script:GuardInput = 'ime|input|textservice|voice|mic|audio|sapi|speech|ctfmon'
+
+# 服务/基础设施类：跑在用户会话里也不能自动杀
+$script:GuardInfra = ('mysql|mysqld|postgres|redis|mongo|sqlservr|oracle|sqlagent|mariadb|' +
+    'dockerd|docker|containerd|wsl|vmmem|nginx|apache|httpd|iis|' +
+    'rtkaud|realtek|nvaudio|igfx|nvdisplay|nvcontainer|audiosrv')
+
+# 加分特征
+$script:HintUpdater = 'update|updater|setup|install|upgrade|patch|download'
+$script:HintReporter = 'crashpad|crashreport|reporter|telemetry|feedback|diagnostic|analytics|metric|survey'
+$script:HintHelper = 'helper|assistant|dashboard|widget|overlay|tray|watchdog|monitor|agent|daemon|servicehost|launcher|bootstrap'
+
+function Get-AutostartExeSet {
+    # 所有挂在自启点上的 exe 名（小写），用来给「在自启列表里」加分
+    $set = New-Object System.Collections.Generic.HashSet[string]
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKCU:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'
+    )
+    foreach ($k in $keys) {
+        if (-not (Test-Path -LiteralPath $k)) { continue }
+        try {
+            $props = Get-ItemProperty -LiteralPath $k -ErrorAction Stop
+            foreach ($pr in $props.PSObject.Properties) {
+                if ($pr.Name -like 'PS*') { continue }
+                $v = [string]$pr.Value
+                if ($v -match '([^\\/:"]+\.exe)') { [void]$set.Add($matches[1].ToLower()) }
+            }
+        } catch { }
+    }
+    foreach ($f in @(
+            (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'),
+            (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup'))) {
+        if (-not (Test-Path -LiteralPath $f)) { continue }
+        try {
+            Get-ChildItem -LiteralPath $f -File -ErrorAction Stop | ForEach-Object {
+                if ($_.Name -match '([^\\/:"]+?)\.(exe|lnk)$') { [void]$set.Add($matches[1].ToLower()) }
+            }
+        } catch { }
+    }
+    return $set
+}
+
+function Get-ReclaimReport {
+    <#
+      给每个进程算一个「可回收分」。
+      分数越高 = 越没用、杀掉的代价越小。
+      返回对象数组，每项带 Score / Verdict / Reasons。
+    #>
+    param(
+        [Parameter(Mandatory)] $Cfg,
+        [int]$SampleMs = 200
+    )
+
+    $selfTree = Get-SelfTree
+    $cmdMap = Get-ProcIndex
+    $autostart = Get-AutostartExeSet
+    $protectSet = @($Cfg.Protect) + @($KeepNames)
+
+    $all = @(Get-Process)
+    $live = @{}
+    foreach ($p in $all) { $live[[int]$p.Id] = $true }
+
+    # CPU 两次采样算占用率（.CPU 是累计 CPU 秒数）
+    $c0 = @{}
+    foreach ($p in $all) { try { $c0[[int]$p.Id] = [double]$p.CPU } catch { $c0[[int]$p.Id] = -1 } }
+    Start-Sleep -Milliseconds $SampleMs
+    $c1 = @{}
+    foreach ($p in $all) { try { $c1[[int]$p.Id] = [double]$p.CPU } catch { $c1[[int]$p.Id] = -1 } }
+
+    $cores = [Environment]::ProcessorCount
+    $companyCache = @{}
+    $out = New-Object System.Collections.Generic.List[object]
+
+    foreach ($p in $all) {
+        $id = [int]$p.Id
+        if ($id -le 8) { continue }
+        if ($selfTree.Contains($id)) { continue }
+        # 会话 0 = 服务会话。那里的东西不归这个工具管，杀了可能直接搞挂系统
+        try { if ($p.SessionId -eq 0) { continue } } catch { }
+
+        $name = $p.ProcessName
+        $nameLower = $name.ToLower()
+
+        # ---- 硬否决 ----
+        if ($name -match $script:GuardSystem) { continue }
+        if ($name -match $script:GuardGame) { continue }
+        if ($name -match $script:GuardInput) { continue }
+        if ($name -match $script:GuardInfra) { continue }
+        $blockedByList = $false
+        foreach ($n in $protectSet) { if ($name -like $n) { $blockedByList = $true; break } }
+        if ($blockedByList) { continue }
+
+        $path = ''
+        try { $path = [string]$p.Path } catch { }
+        if ($path -and $path -match $script:GuardGame) { continue }
+
+        $privMB = 0.0
+        try { $privMB = [double]$p.PrivateMemorySize64 / 1MB } catch { }
+        $wsMB = 0.0
+        try { $wsMB = [double]$p.WorkingSet64 / 1MB } catch { }
+        if ($privMB -lt 15) { continue }     # 太小，不值得动
+
+        $title = ''
+        try { $title = [string]$p.MainWindowTitle } catch { }
+
+        # 进程年龄，后面多处要用
+        $ageH = 0.0
+        try {
+            if ($p.StartTime) { $ageH = ((Get-Date) - $p.StartTime).TotalHours }
+        } catch { }
+
+        $score = 0
+        $reasons = New-Object System.Collections.Generic.List[string]
+        # 强证据：没有「这个进程本来就该退出」的证据，最高只能评到「谨慎」
+        $strong = $false
+
+        # 1) 内存体量（800MB 封顶）
+        $memScore = [Math]::Min(20, [int]($privMB / 40))
+        if ($memScore -gt 0) {
+            $score += $memScore
+            $reasons.Add(("{0:N0}MB 私有内存" -f $privMB))
+        }
+
+        # 2) 更新器 / 安装器 —— 跑完就该退，最强的可杀信号
+        if ($nameLower -match $script:HintUpdater) {
+            $score += 50
+            $strong = $true
+            $reasons.Add('名字像更新器')
+        } elseif ($path -and $path -match '(?i)\\update') {
+            $score += 35
+            $strong = $true
+            $reasons.Add('装在 update 目录')
+        }
+
+        # 3) 崩溃上报 / 遥测
+        if ($nameLower -match $script:HintReporter) {
+            $score += 30
+            $strong = $true
+            $reasons.Add('上报/遥测类')
+        }
+
+        # 4) 临时目录
+        if ($path -and $path -match '(?i)\\(temp|tmp)\\') {
+            $score += 30
+            $strong = $true
+            $reasons.Add('跑在 Temp 目录')
+        }
+
+        # 5) 孤儿进程：父进程已退出且活了半小时以上
+        $parentId = 0
+        $ci = $cmdMap[$id]
+        if ($ci) { $parentId = [int]$ci.ParentProcessId }
+        $isOrphan = ($parentId -gt 0 -and -not $live.ContainsKey($parentId))
+        if ($isOrphan -and $ageH -gt 0.5) {
+            $score += 12
+            $strong = $true
+            $reasons.Add('父进程已退出')
+        }
+
+        # 6) 辅助壳
+        if ($nameLower -match $script:HintHelper) {
+            $score += 15
+            $reasons.Add('辅助/托管类')
+        }
+
+        # 7) 没窗口
+        if (-not $title) { $score += 8 }
+
+        # 8) CPU 空转
+        $cpuPct = -1
+        if ($c0.ContainsKey($id) -and $c1.ContainsKey($id) -and $c0[$id] -ge 0 -and $c1[$id] -ge 0 -and $SampleMs -gt 0) {
+            $delta = $c1[$id] - $c0[$id]
+            if ($delta -ge 0) { $cpuPct = $delta / ($SampleMs / 1000.0) * 100.0 / [Math]::Max(1, $cores) }
+        }
+        if ($cpuPct -ge 0 -and $cpuPct -lt 0.5) {
+            $score += 8
+            $reasons.Add('CPU 空转')
+        } elseif ($cpuPct -ge 5) {
+            $score -= 25
+            $reasons.Add('正在吃 CPU')
+        }
+
+        # 9) 挂在自启上
+        $exeKey = "$nameLower.exe"
+        if ($autostart.Contains($exeKey) -or $autostart.Contains($nameLower)) {
+            $score += 6
+            $reasons.Add('是自启项')
+        }
+
+        # 10) Electron / CEF 子进程
+        if ($ci -and $ci.CommandLine -and $ci.CommandLine -match '--type=(renderer|gpu-process|utility|zygote)') {
+            $score += 6
+            $reasons.Add('浏览器内核子进程')
+        }
+
+        # 11) 长跑且无窗口
+        if ($ageH -gt 6 -and -not $title) {
+            $score += 5
+        }
+
+        # ---- 减分 / 保护 ----
+        if ($title) {
+            $score -= 500
+            # 窗口标题像更新器的，不算有窗口
+            if ($title -match '(?i)update|更新|升级') { $score += 480 }
+        }
+        if ($path -and $path -match '(?i)^[a-z]:\\windows\\') {
+            $score -= 300
+            $reasons.Add('在 Windows 目录')
+        }
+        if (-not $companyCache.ContainsKey($name)) {
+            $co = ''
+            try { $co = [string]$p.Company } catch { }
+            $companyCache[$name] = $co
+        }
+        if ($companyCache[$name] -match '(?i)microsoft') {
+            $score -= 300
+            $reasons.Add('微软签名')
+        }
+
+        # ---- 裁决 ----
+        $verdict = '别动'
+        if ($score -ge 70 -and $strong) { $verdict = '可杀' }
+        elseif ($score -ge 45) { $verdict = '谨慎' }
+        elseif ($score -ge 15) { $verdict = '观察' }
+
+        $out.Add([pscustomobject]@{
+            Id      = $id
+            Name    = $name
+            PrivMB  = [Math]::Round($privMB, 0)
+            WsMB    = [Math]::Round($wsMB, 0)
+            Score   = [int]$score
+            Verdict = $verdict
+            CpuPct  = [Math]::Round($cpuPct, 1)
+            AgeH    = [Math]::Round($ageH, 1)
+            Title   = $title
+            Reasons = ($reasons -join '、')
+        })
+    }
+
+    return @($out | Sort-Object Score -Descending)
+}
+
+# ============================================================
 #  候选解析
 # ============================================================
 
@@ -701,74 +968,93 @@ function Show-Top {
 }
 
 function Show-Suggest {
-    param($Cfg)
+    param($Cfg, [int]$MinScore = 15)
 
-    $lines = New-Object System.Collections.Generic.List[object]
-    $selfTree = Get-SelfTree
-    $cmdMap = Get-ProcIndex
-    $protectSet = @($Cfg.Protect) + @($KeepNames)
-    $gameRunning = $false
-    foreach ($p in Get-Process) {
-        if ($p.WorkingSet64 -gt 700MB -and (Test-IsGame $p $cmdMap $Cfg)) { $gameRunning = $true; break }
+    if (-not $Quiet) { Write-Host '  采样 CPU 占用中...' -ForegroundColor DarkGray }
+    $rep = @(Get-ReclaimReport -Cfg $Cfg)
+
+    $shown = @($rep | Where-Object { $_.Score -ge $MinScore })
+
+    Write-Head '可回收评分（越高越好杀；规则不依赖进程名）'
+    Write-Host ('  {0,4}  {1,-4} {2,7} {3,7}  {4,-26} {5,-7} {6}' -f '分', '裁决', '私有', '工作集', '进程', 'pid', '依据') -ForegroundColor DarkGray
+
+    foreach ($r in $shown) {
+        $color = 'DarkGray'
+        if ($r.Verdict -eq '可杀') { $color = 'Green' }
+        elseif ($r.Verdict -eq '谨慎') { $color = 'Yellow' }
+        $why = $r.Reasons
+        if ($why.Length -gt 44) { $why = $why.Substring(0, 42) + '..' }
+        $line = '  {0,4}  {1,-4} {2,5}MB {3,5}MB  {4,-26} {5,-7} {6}' -f $r.Score, $r.Verdict, $r.PrivMB, $r.WsMB, $r.Name, $r.Id, $why
+        Write-Host $line -ForegroundColor $color
+        if ($r.Title) { Write-Host ('         「' + $r.Title + '」') -ForegroundColor DarkGray }
     }
 
-    $light = @(Get-CommittedLevels $Cfg 'light')
-    $normal = @(Get-CommittedLevels $Cfg 'normal')
-    $heavy = @(Get-CommittedLevels $Cfg 'heavy')
+    $killable = @($rep | Where-Object { $_.Verdict -eq '可杀' })
+    $cautious = @($rep | Where-Object { $_.Verdict -eq '谨慎' })
+    $sumK = 0.0
+    if ($killable.Count -gt 0) { $sumK = ($killable | Measure-Object PrivMB -Sum).Sum }
+    $sumC = 0.0
+    if ($cautious.Count -gt 0) { $sumC = ($cautious | Measure-Object PrivMB -Sum).Sum }
 
-    foreach ($p in (Get-Process | Sort-Object PrivateMemorySize64 -Descending)) {
-        if ($p.Id -le 8) { continue }
-        if ($selfTree.Contains([int]$p.Id)) { continue }
-        if ($p.SessionId -eq 0) { continue }
-        $mb = 0.0
-        $ws = 0.0
-        try { $mb = [double]$p.PrivateMemorySize64 / 1MB } catch { continue }
-        try { $ws = [double]$p.WorkingSet64 / 1MB } catch { }
-        if ($mb -lt 30) { continue }
-
-        $pn = $p.ProcessName
-        $prot = $false
-        foreach ($n in $protectSet) { if ($pn -like $n) { $prot = $true; break } }
-        $isGame = Test-IsGame $p $cmdMap $Cfg
-
-        $tag = ''
-        if (Test-IsGame $p $cmdMap $Cfg) {
-            if (Test-IsSteam $p) { $tag = 'steam 保护' } else { $tag = 'GAME 保护' }
-        }
-        elseif ($prot) { $tag = 'system 保护' }
-        elseif (Test-IsMine $p $cmdMap) { $tag = 'dsh 保护' }
-        elseif ($light -contains $pn -or (& { foreach ($n in $light) { if ($pn -like $n) { return $true } } return $false })) { $tag = 'light' }
-        elseif (& { foreach ($n in $normal) { if ($pn -like $n) { return $true } } return $false }) { $tag = 'normal' }
-        elseif (& { foreach ($n in $heavy) { if ($pn -like $n) { return $true } } return $false }) { $tag = 'heavy' }
-        else { $tag = '-' }
-
-        $title = ''
-        try { $title = [string]$p.MainWindowTitle } catch { }
-
-        $lines.Add([pscustomobject]@{ MB = [Math]::Round($mb, 0); WS = [Math]::Round($ws, 0); Name = $pn; Id = $p.Id; Tag = $tag; Title = $title })
-    }
-
-    Write-Head '可回收进程（按私有内存排序，仅列 ≥30MB）'
-    Write-Host ('  {0,7}  {1,6}  {2,-30} {3,-8} {4}' -f '私有', '工作集', '进程', 'pid', '分类') -ForegroundColor DarkGray
-    foreach ($l in ($lines | Sort-Object MB -Descending)) {
-        $color = switch -Wildcard ($l.Tag) {
-            'GAME*' { 'DarkCyan' }
-            'steam*' { 'DarkCyan' }
-            'system*' { 'DarkGray' }
-            'dsh*' { 'DarkGray' }
-            'light' { 'Green' }
-            'normal' { 'Yellow' }
-            'heavy' { 'Magenta' }
-            default { 'DarkGray' }
-        }
-        $line = '  {0,5} MB  {1,5} MB  {2,-30} {3,-8} {4,-13}' -f $l.MB, $l.WS, $l.Name, $l.Id, $l.Tag
-        Write-Host $line -ForegroundColor $color -NoNewline
-        if ($l.Title) { Write-Host ('  ' + $l.Title) -ForegroundColor DarkGray } else { Write-Host '' }
-    }
     Write-Host ''
-    Write-Host '  绿色=light 可直接杀   黄色=normal   洋红=heavy 会关掉窗口   ' -NoNewline -ForegroundColor DarkGray
-    Write-Host '青色/灰色=保护，不会被碰' -ForegroundColor DarkGray
-    if ($gameRunning) { Write-Host '  当前检测到游戏在跑：Steam 全家已保护。' -ForegroundColor DarkCyan }
+    Write-Host ('  可杀（≥70 分）      {0,3} 个  {1,7}' -f $killable.Count, (Format-MB $sumK)) -ForegroundColor Green
+    Write-Host ('  谨慎（45-69 分）    {0,3} 个  {1,7}' -f $cautious.Count, (Format-MB $sumC)) -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '  动手：ram -Mode auto          只杀「可杀」那些' -ForegroundColor DarkGray
+    Write-Host '        ram -Mode auto -IncludeCautious   连「谨慎」一起' -ForegroundColor DarkGray
+    Write-Host '        ram -Mode auto -DryRun     先看一遍' -ForegroundColor DarkGray
+    Write-Host '  评分依据的是行为特征（更新器/孤儿/空转/无窗口/临时目录），' -ForegroundColor DarkGray
+    Write-Host '  不是进程名，所以换任何 Windows 机器都成立。' -ForegroundColor DarkGray
+}
+
+function Invoke-Auto {
+    param($Cfg, [int]$MinScore = 70, [switch]$IncludeCautious)
+
+    if (-not $Quiet) { Write-Host '  采样 CPU 占用中...' -ForegroundColor DarkGray }
+    $rep = @(Get-ReclaimReport -Cfg $Cfg)
+
+    $threshold = $MinScore
+    if ($IncludeCautious) { $threshold = 45 }
+    $targets = @($rep | Where-Object { $_.Score -ge $threshold } | Sort-Object Score -Descending)
+
+    if ($targets.Count -eq 0) {
+        Write-Head 'AUTO'
+        Write-Host "  没有评分 >= $threshold 的进程。这台机器没明显可回收的闲散进程。" -ForegroundColor Green
+        return $null
+    }
+
+    $sum = ($targets | Measure-Object PrivMB -Sum).Sum
+    Write-Head ("AUTO 目标（阈值 {0} 分）  {1} 个 / 私有内存 {2}" -f $threshold, $targets.Count, (Format-MB $sum))
+    foreach ($t in $targets) {
+        Write-Host ('  {0,4} 分  {1,5}MB  {2,-28} pid {3,-7}' -f $t.Score, $t.PrivMB, $t.Name, $t.Id) -ForegroundColor Gray -NoNewline
+        $why = $t.Reasons
+        if ($why.Length -gt 40) { $why = $why.Substring(0, 38) + '..' }
+        Write-Host ('  ' + $why) -ForegroundColor DarkGray
+    }
+
+    if ($DryRun) {
+        Write-Host '  (DryRun：以上均未执行)' -ForegroundColor Yellow
+        return $null
+    }
+
+    $before = Get-MemSnapshot
+    $killed = 0
+    foreach ($t in $targets) {
+        try { Stop-Process -Id $t.Id -Force -ErrorAction Stop; $killed++ } catch { }
+    }
+    Start-Sleep -Milliseconds 800
+    $after = Get-MemSnapshot
+
+    $bAvail = [double]$before.AvailableMB
+    $aAvail = [double]$after.AvailableMB
+    $delta = $aAvail - $bAvail
+    if ($delta -lt 0) { $delta = 0 }
+
+    Write-Head 'AUTO 结果'
+    Write-Line '已结束' ("{0} / {1} 个进程" -f $killed, $targets.Count) 'White'
+    Write-Line '可用内存' ("{0}  →  {1}   (+{2})" -f (Format-MB $bAvail), (Format-MB $aAvail), (Format-MB $delta)) 'Green'
+    Write-Line '使用率' ("{0:N1}%  →  {1:N1}%" -f $before.UsedPct, $after.UsedPct) 'Green'
+    return $after
 }
 
 function Show-Residue {
@@ -894,6 +1180,10 @@ switch ($Mode) {
     }
     'watch' {
         Invoke-Watch -Cfg $Cfg
+    }
+    'auto' {
+        Show-Memory (Get-MemSnapshot)
+        [void](Invoke-Auto -Cfg $Cfg -MinScore $MinScore -IncludeCautious:$IncludeCautious)
     }
 }
 

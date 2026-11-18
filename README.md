@@ -22,26 +22,71 @@ Windows 内存回收 + 开机自启管理，纯 PowerShell，零依赖，中文�
 
 ---
 
-## 和别的工具真正的差别
+## 不需要配名单：评分，而不是白名单
 
-`EmptyWorkingSet` 和 `NtSetSystemInformation(SystemMemoryListInformation)` 是 Windows 20 年前就有的内部接口，谁都能调。这个项目不提供任何新的技术。
+`EmptyWorkingSet` 和 `NtSetSystemInformation(SystemMemoryListInformation)` 是 Windows 20 年前就有的内部接口，谁都能调。这个项目不提供任何新技术。
 
-不一样的是**判断逻辑**：
+不一样的是**怎么判断一个进程该不该杀**。
 
-**游戏保护。** 检测到有 `>700MB` 且路径落在 `steamapps` / `Epic Games` / `XboxGames` 之类的进程在跑时，自动进入保护模式——Steam 全家、游戏本体、反作弊进程全部排除，「有主窗口的进程」一律跳过。杀进程类的工具通常没有这一层，会在你打一半的时候把游戏干掉。
+别的清理脚本靠「进程名白名单」——写死 `chrome.exe`、`QQ.exe` 该不该动。换个软件就失效，换台电脑就得从头配一遍。
 
-**双列内存视图。** `suggest` 模式同时显示私有内存（杀进程能省多少）和工作集（trim 能压多少），并标出每个进程被保护的原因。市面上的工具大多只给一个总数。
+这里反过来：**给每个进程打分**，判据是行为特征，不是名字。规则在任何 Windows 机器上成立。
+
+| 特征 | 分 | 依据 |
+|---|---|---|
+| 名字含 `update` / `setup` / `install` / `patch` | **+50** | 更新器跑完就该退出 |
+| 装在 `\update` 目录 | +35 | 同上 |
+| 跑在 `\Temp\` / `\Tmp\` 目录 | +30 | 临时目录里的东西 |
+| 名字含 `crashpad` / `telemetry` / `reporter` / `analytics` | +30 | 上报与遥测 |
+| 父进程已退出且活了 30 分钟以上 | +12 | 孤儿进程 |
+| 名字含 `helper` / `overlay` / `widget` / `tray` / `watchdog` | +15 | 辅助壳 |
+| 没有主窗口 | +8 | |
+| CPU 空转（<0.5%） | +8 | 闲着 |
+| 私有内存 | 最多 +20 | 800MB 封顶 |
+| 在自启列表里 | +6 | |
+| 浏览器内核子进程（`--type=renderer`） | +6 | |
+
+### 否决级保护（命中直接排除）
+
+- **会话 0** —— 服务会话里的东西不归这工具管
+- **系统关键进程** —— `csrss` `lsass` `svchost` `dwm` `explorer` `MsMpEng` 等
+- **输入法 / 音频** —— `ime` `input` `audio` `mic` `speech` `ctfmon`
+- **游戏与反作弊** —— `steam` `epic` `battleye` `vanguard` `EasyAntiCheat` `ACE` `SGuard`
+- **数据库 / 容器** —— `mysqld` `postgres` `redis` `mongo` `sqlservr` `dockerd`
+- **有主窗口**（窗口标题含「更新/升级」的除外）
+- **微软签名**，或装在 `C:\Windows\` 下
+- **当前进程自己的整条父链**
+
+### 裁决
+
+| 分数 | 裁决 | 含义 |
+|---|---|---|
+| **≥70 且命中「强证据」** | **可杀** | `ram -Mode auto` 只动这些 |
+| 45 – 69 | 谨慎 | 加 `-IncludeCautious` 才动 |
+| 15 – 44 | 观察 | 只列出来给你看 |
+| < 15 | 别动 | 不显示 |
+
+**「强证据」= 命中更新器 / 遥测 / 临时目录 / 孤儿 中的至少一条。**
+
+一个只是「安静、占内存」的进程永远进不了「可杀」。所以 QQ、微信、你的编辑器、
+正开着的浏览器不会被自动干掉——它们没有「本来就该退出」的证据。
+
+实际输出：
 
 ```
-       私有     工作集  进程                    pid      分类
-   8786 MB   4262 MB  RelicCardinal          8456     GAME 保护
-    895 MB    819 MB  msedge                 42360    heavy
-    617 MB    119 MB  msedge                 22656    heavy
-    358 MB    289 MB  wetype_update          2280     light
-    175 MB    104 MB  NVIDIA Overlay         17828    normal
+   分  裁决       私有     工作集  进程                    pid     依据
+   75  可杀     373MB     67MB  wetype_update          50512   373MB 私有内存、名字像更新器、CPU 空转
+   48  谨慎    3013MB     39MB  python                 36308   3,013MB 私有内存、父进程已退出、CPU 空转
+   40  观察     106MB     18MB  NVIDIA Overlay         43844   106MB 私有内存、辅助/托管类、CPU 空转
+   29  观察     293MB    211MB  QQ                     42180   293MB 私有内存、CPU 空转、浏览器内核子进程
 ```
+
+### 另外还有两件事
+
+**游戏保护。** 检测到有 `>700MB` 且路径落在 `steamapps` / `Epic Games` / `XboxGames` 的进程在跑时，自动进入保护模式——Steam 全家、游戏本体、反作弊全部排除。
 
 **自启管理和内存清理在同一个包里。** 实际场景就是「这台电脑变慢了」，两件事一起做，而不是装两个工具。
+
 
 ---
 
@@ -84,8 +129,9 @@ noauto                       # 列出所有开机自启项
 | `kill` | 按等级杀无用进程 | 否 |
 | `full` | trim + purge + kill | purge 部分需要 |
 | `watch` | 常驻守护：定时 trim，低于阈值自动 kill | 否 |
+| `auto` | **按评分自动杀**——只动 ≥70 分且有强证据的进程 | 否 |
 
-### 等级
+### 等级（老的分名单模式，仍然保留）
 
 | `-Level` | 杀什么 |
 |---|---|
@@ -94,6 +140,8 @@ noauto                       # 列出所有开机自启项
 | `heavy` | normal + 浏览器、QQ、WPS、Steam、Electron、搜索 |
 
 `light` / `normal` / `heavy` 都**不碰有主窗口的进程**。要真的关窗口，加 `-IncludeWindowed`。
+
+> `-Mode auto` 不需要 `-Level`。评分引擎自己判断，换机器不用改任何东西。
 
 ### 安全设计
 
@@ -111,11 +159,13 @@ noauto                       # 列出所有开机自启项
 ```powershell
 -Top 15                  # report 显示行数
 -DryRun                  # 只打印不执行
--KeepNames msedge,QQ     # 本次额外保护
--KillNames notepad       # 本次额外要杀
+-KeepNames msedge,QQ     # 本次额外保护（评分时直接排除）
+-KillNames notepad       # 本次额外要杀（按等级名单）
 -KillPid 1234            # 按 PID 精确杀（绕过白名单和窗口保护）
 -IncludeWindowed         # 连有窗口的也杀
 -IncludeGame             # 连游戏也杀
+-IncludeCautious         # auto 模式连「谨慎」（45 分以上）一起杀
+-MinScore 70             # 改 auto 的分数阈值
 -AggressiveTrim          # trim 不跳过大进程和窗口进程（会卡）
 -NoGameGuard             # 关掉游戏自动保护
 -Elevate                 # 自动弹 UAC 以管理员重开
