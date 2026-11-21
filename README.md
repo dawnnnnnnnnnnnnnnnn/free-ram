@@ -97,7 +97,7 @@ Windows 内存回收 + 开机自启管理，纯 PowerShell，零依赖，中文�
 # 下载 ZIP，解压到任意位置，双击 Setup.cmd，之后双击桌面「释放内存」
 
 # 方式二：手动
-git clone https://github.com/<you>/free-ram.git
+git clone https://github.com/dawnnnnnnnnnnnnnnnn/free-ram.git
 cd free-ram
 .\Setup.ps1                 # 装别名 + 桌面快捷方式
 ```
@@ -213,7 +213,7 @@ noauto                       # 列出所有开机自启项
 
 ## 已知限制
 
-**杀进程名单是为作者那台机器调的。** `ArmouryCrate`、`wetype_update`、`RelicCardinal` 这些在别的机器上不命中，**不会误杀，只是没效果**。换机器先跑 `ram -Mode suggest`，把标 `-`（未分类）的进程挑出来加进名单。
+**评分是启发式的，不认识你的具体软件。** 它靠「更新器 / 遥测 / 临时目录 / 孤儿 / 辅助壳」这些通用特征判断，不依赖进程名，所以换机器零配置。但反过来说，一个你不想要、又不具备这些特征的常驻程序（比如某个纯后台的采集服务）它认不出来，会停在「观察」档。这种情况用 `-KillNames` 或改 `$script:DefaultLevels` 补。
 
 **EDR 可能让 trim 静默失效。** `Add-Type` 要在运行时调 `csc.exe` 编译一小段 C#。SentinelOne、CrowdStrike 这类会拦它——结果是脚本照跑、报告照出、一个进程都没压（[相关 issue](https://github.com/Nailuu/wsl-screenshot-cli/issues/3)）。`Setup.ps1` 的自检会明确报告这一项能不能用。`kill` 和 `purge` 不依赖编译器，不受影响。
 
@@ -221,7 +221,10 @@ noauto                       # 列出所有开机自启项
 
 **`purge` 需要管理员。** 普通权限下会提示并以普通模式继续。
 
+**从网上下载的 ZIP 会带「来自其他计算机」标记。** 浏览器/微信/QQ 传过来的压缩包，解压后每个文件都被打上 `Zone.Identifier=3`，PowerShell 可能拒绝加载。两个 `.cmd` 入口的第一行就是递归 `Unblock-File`，正常双击不会遇到；如果手动跑 `.ps1` 报错，先解压后右键 zip → 属性 → 勾「解除锁定」。
+
 **只在 Windows 10 1809+ / Windows 11 上验证过。** build 低于 17763 的系统 `purge` 可能无效。
+
 
 ---
 
