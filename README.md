@@ -2,7 +2,7 @@
 
 Windows 内存回收 + 开机自启管理，纯 PowerShell，零依赖，中文。
 
-**它不是通用的内存清理器。** 通用清理器请用 [Mem Reduct](https://github.com/henrypp/memreduct)，成熟、有 GUI、有托盘。
+通用内存清理请用 [Mem Reduct](https://github.com/henrypp/memreduct)，成熟、有 GUI、有托盘。
 这个项目只解决两个具体场景：
 
 1. **正在玩游戏的时候想腾内存**，但不能把游戏、Steam、反作弊、你正开着的窗口杀掉
@@ -22,15 +22,13 @@ Windows 内存回收 + 开机自启管理，纯 PowerShell，零依赖，中文�
 
 ---
 
-## 不需要配名单：评分，而不是白名单
+## 不用配名单：给进程打分
 
 `EmptyWorkingSet` 和 `NtSetSystemInformation(SystemMemoryListInformation)` 是 Windows 20 年前就有的内部接口，谁都能调。这个项目不提供任何新技术。
 
-不一样的是**怎么判断一个进程该不该杀**。
+判断一个进程该不该杀，别的清理脚本靠「进程名白名单」——写死 `chrome.exe`、`QQ.exe` 该不该动。换个软件就失效，换台电脑就得从头配一遍。
 
-别的清理脚本靠「进程名白名单」——写死 `chrome.exe`、`QQ.exe` 该不该动。换个软件就失效，换台电脑就得从头配一遍。
-
-这里反过来：**给每个进程打分**，判据是行为特征，不是名字。规则在任何 Windows 机器上成立。
+这里改成**给每个进程打分**，判据是行为特征，不是名字。规则在任何 Windows 机器上成立。
 
 | 特征 | 分 | 依据 |
 |---|---|---|
